@@ -31,6 +31,7 @@ type MultiCloud struct {
 	requestIDs       map[string]interface{}
 	backendNodes     []string
 	deadBackendNodes []string
+	backendStatus    map[string]bool
 	mutex            sync.RWMutex
 }
 
@@ -40,6 +41,10 @@ type BlobInfo struct {
 	LastModified *time.Time
 	Size         *uint64
 	StorageClass *string
+}
+
+type MultiPartUploadInfo struct {
+	Node string
 }
 
 func httpStatusCode(err error) int {
@@ -63,9 +68,9 @@ func asAwsError(err error) awserr.Error {
 	return awserr.New("", "", err)
 }
 
-func asAwsRequestError(err error, requestId string) awserr.RequestFailure {
+func asAwsRequestError(err error, reqId string) awserr.RequestFailure {
 	return awserr.NewRequestFailure(
-		awserr.New("", "", err), httpStatusCode(err), requestId)
+		awserr.New("", "", err), httpStatusCode(err), reqId)
 }
 
 func NewMultiCloud(bucket string, flags *FlagStorage, config *MultiCloudConfig) (*MultiCloud, error) {
@@ -79,10 +84,11 @@ func NewMultiCloud(bucket string, flags *FlagStorage, config *MultiCloudConfig) 
 	}
 
 	cloud := &MultiCloud{
-		bucket:   bucket,
-		cap:      Capabilities{Name: "s3"},
-		kv:       c,
-		backends: make(map[string]StorageBackend),
+		bucket:        bucket,
+		cap:           Capabilities{Name: "s3"},
+		kv:            c,
+		backends:      make(map[string]StorageBackend),
+		backendStatus: make(map[string]bool),
 	}
 
 	for _, bc := range config.Backends {
@@ -102,6 +108,7 @@ func NewMultiCloud(bucket string, flags *FlagStorage, config *MultiCloudConfig) 
 
 			cloud.backends[bc.Name] = backend
 			cloud.backendNodes = append(cloud.backendNodes, bc.Name)
+			cloud.backendStatus[bc.Name] = true
 		}
 	}
 	sort.Strings(cloud.backendNodes)
@@ -121,20 +128,9 @@ func NewMultiCloud(bucket string, flags *FlagStorage, config *MultiCloudConfig) 
 func (cloud *MultiCloud) markNodeStatus(node string, healthy bool) {
 	// check if it is already in the dead/alive list
 	cloud.mutex.RLock()
-	if healthy {
-		for _, n := range cloud.backendNodes {
-			if n == node {
-				cloud.mutex.RUnlock()
-				return
-			}
-		}
-	} else {
-		for _, n := range cloud.deadBackendNodes {
-			if n == node {
-				cloud.mutex.RUnlock()
-				return
-			}
-		}
+	if cloud.backendStatus[node] == healthy {
+		cloud.mutex.RUnlock()
+		return
 	}
 	cloud.mutex.RUnlock()
 
@@ -143,6 +139,8 @@ func (cloud *MultiCloud) markNodeStatus(node string, healthy bool) {
 
 	cloud.mutex.Lock()
 	defer cloud.mutex.Unlock()
+
+	cloud.backendStatus[node] = healthy
 
 	newBackendNodes := []string{}
 	newDeadBackendNodes := []string{}
@@ -191,25 +189,6 @@ func (cloud *MultiCloud) checkNodeStatus() {
 	}
 }
 
-func (cloud *MultiCloud) getBlogBackend(key string) (string, StorageBackend, error) {
-	key = cloud.kvBlobKey(key)
-	mlog.Debugf("key is %s for blob", key)
-
-	var info BlobInfo
-	err := cloud.kvGet(key, &info)
-	if err != nil {
-		return "", nil, err
-	}
-
-	node := info.Node
-	mlog.Debugf("Get node name %s for blob", node)
-	if backend, ok := cloud.backends[node]; ok {
-		return node, backend, nil
-	} else {
-		return "", nil, syscall.ENOENT
-	}
-}
-
 func (cloud *MultiCloud) selectBackend(key string) (string, StorageBackend, error) {
 	cloud.mutex.RLock()
 	defer cloud.mutex.RUnlock()
@@ -230,8 +209,8 @@ func (cloud *MultiCloud) kvBlobKey(key string) string {
 	return "blob/" + cloud.bucket + ":" + key
 }
 
-func (cloud *MultiCloud) kvIntentKey(requestId string, op string) string {
-	return "intent/" + requestId + "-" + op
+func (cloud *MultiCloud) kvIntentKey(reqId string, op string) string {
+	return "intent/" + reqId + "-" + op
 }
 
 func (cloud *MultiCloud) kvPut(key string, value interface{}) error {
@@ -264,7 +243,22 @@ func (cloud *MultiCloud) kvDelete(key string) error {
 	return err
 }
 
-func (cloud *MultiCloud) kvList(param *ListBlobsInput) (*ListBlobsOutput, error) {
+func (cloud *MultiCloud) putBlobInfo(key string, info *BlobInfo) error {
+	return cloud.kvPut(cloud.kvBlobKey(key), info)
+}
+
+func (cloud *MultiCloud) getBlobInfo(key string) (*BlobInfo, error) {
+	var info BlobInfo
+	err := cloud.kvGet(cloud.kvBlobKey(key), &info)
+	return &info, err
+}
+
+func (cloud *MultiCloud) deleteBlobInfo(key string) error {
+	err := cloud.kvDelete(cloud.kvBlobKey(key))
+	return err
+}
+
+func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -298,11 +292,10 @@ func (cloud *MultiCloud) kvList(param *ListBlobsInput) (*ListBlobsOutput, error)
 			return nil, syscall.EINVAL
 		}
 		if err != nil {
-			mlog.Debugf("Got listKV error %+v", err)
+			mlog.Debugf("ListBlobs Got error %+v", err)
 			return nil, err
 		}
 
-		mlog.Debugf("listKV response %+v", resp)
 		if len(resp.Kvs) == 0 {
 			goto out
 		}
@@ -382,35 +375,35 @@ out:
 	return output, nil
 }
 
-func (cloud *MultiCloud) writeIntentLog(requestId string, op string, param interface{}) error {
-	key := cloud.kvIntentKey(requestId, op)
+func (cloud *MultiCloud) putIntentLog(reqId string, op string, param interface{}) error {
+	key := cloud.kvIntentKey(reqId, op)
 	err := cloud.kvPut(key, param)
 	return err
 }
 
-func (cloud *MultiCloud) deleteIntentLog(requestId string, op string) error {
-	key := cloud.kvIntentKey(requestId, op)
+func (cloud *MultiCloud) deleteIntentLog(reqId string, op string) error {
+	key := cloud.kvIntentKey(reqId, op)
 	_, err := cloud.kv.Delete(context.Background(), key, nil)
 	return err
 }
 
-func (cloud *MultiCloud) writeMultiPartNodeName(uploadId string, name string) error {
+func (cloud *MultiCloud) putMultiPartInfo(uploadId string, info *MultiPartUploadInfo) error {
 	key := "multipart/" + uploadId
-	err := cloud.kvPut(key, &name)
+	err := cloud.kvPut(key, info)
 	return err
 }
 
-func (cloud *MultiCloud) deleteMultiPartNodeName(uploadId string) error {
+func (cloud *MultiCloud) deleteMultiPartInfo(uploadId string) error {
 	key := "multipart/" + uploadId
 	_, err := cloud.kv.Delete(context.Background(), key, nil)
 	return err
 }
 
-func (cloud *MultiCloud) getMultiPartNodeName(uploadId string) (string, error) {
+func (cloud *MultiCloud) getMultiPartInfo(uploadId string) (*MultiPartUploadInfo, error) {
 	key := "multipart/" + uploadId
-	var node string
-	err := cloud.kvGet(key, &node)
-	return node, err
+	var info MultiPartUploadInfo
+	err := cloud.kvGet(key, &info)
+	return &info, err
 
 }
 
@@ -419,9 +412,10 @@ func requestId() string {
 }
 
 func (cloud *MultiCloud) Init(key string) error {
-	for _, backend := range cloud.backends {
+	for node, backend := range cloud.backends {
 		err := backend.Init(key)
 		if err != nil {
+			cloud.markNodeStatus(node, false)
 			return err
 		}
 	}
@@ -437,31 +431,38 @@ func (cloud *MultiCloud) Bucket() string {
 	return cloud.bucket
 }
 
-func (cloud *MultiCloud) HeadBlob(param *HeadBlobInput) (output *HeadBlobOutput, err error) {
-	requestId := requestId()
-	mlog.Debugf("HeadBlob %+v", param)
+func (cloud *MultiCloud) HeadBlob(param *HeadBlobInput) (out *HeadBlobOutput, err error) {
+	reqId := requestId()
 
+	mlog.Debugf("Enter HeadBlob %+v, reqId %s", param, reqId)
 	defer func() {
-		mlog.Debugf("HeadBlog %+v output %v, error %v", param, output, err)
+		mlog.Debugf("Leave HeadBlog out %v, error %v, reqId %s", out, err, reqId)
 	}()
 
-	_, backend, err := cloud.getBlogBackend(param.Key)
+	info, err := cloud.getBlobInfo(param.Key)
 	if err != nil {
 		mlog.Debugf("Failed to get backend error %+v", err)
 		if err == syscall.ENOENT {
-			return nil, asAwsRequestError(err, requestId)
+			return nil, asAwsRequestError(err, reqId)
 		}
 		return nil, asAwsError(err)
 	}
+	backend, _ := cloud.backends[info.Node]
 	mlog.Debugf("Got backend %+v", backend)
 
-	output, err = backend.HeadBlob(param)
+	out, err = backend.HeadBlob(param)
+
 	return
 }
 
-func (cloud *MultiCloud) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
+func (cloud *MultiCloud) ListBlobs(param *ListBlobsInput) (out *ListBlobsOutput, err error) {
+	reqId := requestId()
 
-	mlog.Debugf("list Blobs")
+	mlog.Debugf("Enter ListBlobs, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave ListBlobs, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
 	if param.Prefix != nil {
 		mlog.Debugf("    Prefix %v", *param.Prefix)
 	}
@@ -477,49 +478,67 @@ func (cloud *MultiCloud) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, err
 	if param.MaxKeys != nil {
 		mlog.Debugf("    maxKeys %v", *param.MaxKeys)
 	}
-	return cloud.kvList(param)
+	out, err = cloud.listBlobs(param)
+
+	return
 }
 
-func (cloud *MultiCloud) DeleteBlob(param *DeleteBlobInput) (*DeleteBlobOutput, error) {
-	requestId := requestId()
-	err := cloud.writeIntentLog(requestId, "DeleteBlob", param)
+func (cloud *MultiCloud) DeleteBlob(param *DeleteBlobInput) (out *DeleteBlobOutput, err error) {
+	reqId := requestId()
+
+	mlog.Debugf("Enter DeleteBlob, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave DeleteBlob, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
+	err = cloud.putIntentLog(reqId, "DeleteBlob", param)
 	if err != nil {
 		return nil, err
 	}
-	defer cloud.deleteIntentLog(requestId, "DeleteBlob")
+	defer cloud.deleteIntentLog(reqId, "DeleteBlob")
 
-	_, backend, err := cloud.getBlogBackend(param.Key)
+	info, err := cloud.getBlobInfo(param.Key)
 	if err != nil {
 		if err == syscall.ENOENT {
-			return nil, asAwsRequestError(err, requestId)
+			return nil, asAwsRequestError(err, reqId)
 		}
 		return nil, asAwsError(err)
 	}
-	return backend.DeleteBlob(param)
+
+	backend := cloud.backends[info.Node]
+
+	out, err = backend.DeleteBlob(param)
+
+	return
 }
 
-func (cloud *MultiCloud) DeleteBlobs(param *DeleteBlobsInput) (*DeleteBlobsOutput, error) {
-	requestId := requestId()
+func (cloud *MultiCloud) DeleteBlobs(param *DeleteBlobsInput) (out *DeleteBlobsOutput, err error) {
+	reqId := requestId()
 
-	err := cloud.writeIntentLog(requestId, "DeleteBlobs", param)
+	mlog.Debugf("Enter DeleteBlobs, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave DeleteBlobs, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
+	err = cloud.putIntentLog(reqId, "DeleteBlobs", param)
 	if err != nil {
 		return nil, err
 	}
-	defer cloud.deleteIntentLog(requestId, "DeleteBlobs")
+	defer cloud.deleteIntentLog(reqId, "DeleteBlobs")
 
 	itemsMap := make(map[string][]string)
 	for _, item := range param.Items {
-		name, _, err := cloud.getBlogBackend(item)
+		info, err := cloud.getBlobInfo(item)
 		if err != nil {
 			if err == syscall.ENOENT {
-				return nil, asAwsRequestError(err, requestId)
+				return nil, asAwsRequestError(err, reqId)
 			}
 			return nil, asAwsError(err)
 		}
-		if l, ok := itemsMap[name]; ok {
-			itemsMap[name] = append(l, item)
+		if l, ok := itemsMap[info.Node]; ok {
+			itemsMap[info.Node] = append(l, item)
 		} else {
-			itemsMap[name] = []string{item}
+			itemsMap[info.Node] = []string{item}
 		}
 	}
 
@@ -529,79 +548,102 @@ func (cloud *MultiCloud) DeleteBlobs(param *DeleteBlobsInput) (*DeleteBlobsOutpu
 		_, err := backend.DeleteBlobs(input)
 		if err != nil {
 			if err == syscall.ENOENT {
-				return nil, asAwsRequestError(err, requestId)
+				return nil, asAwsRequestError(err, reqId)
 			}
 			return nil, asAwsError(err)
 		}
 	}
 
-	return &DeleteBlobsOutput{RequestId: requestId}, nil
+	out = &DeleteBlobsOutput{RequestId: reqId}
+	err = nil
+
+	return
 }
 
-func (cloud *MultiCloud) RenameBlob(param *RenameBlobInput) (*RenameBlobOutput, error) {
-	requestId := requestId()
+func (cloud *MultiCloud) RenameBlob(param *RenameBlobInput) (out *RenameBlobOutput, err error) {
+	reqId := requestId()
 
-	err := cloud.writeIntentLog(requestId, "RenameBlob", param)
+	mlog.Debugf("Enter RenameBlob, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave RenameBlob, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
+	err = cloud.putIntentLog(reqId, "RenameBlob", param)
 	if err != nil {
 		return nil, err
 	}
-	defer cloud.deleteIntentLog(requestId, "RenameBlob")
+	defer cloud.deleteIntentLog(reqId, "RenameBlob")
 
-	name, backend, err := cloud.getBlogBackend(param.Source)
+	info, err := cloud.getBlobInfo(param.Source)
 	if err != nil {
 		if err == syscall.ENOENT {
-			return nil, asAwsRequestError(err, requestId)
+			return nil, asAwsRequestError(err, reqId)
 		}
 		return nil, asAwsError(err)
 	}
 
-	if name2, backend2, err := cloud.getBlogBackend(param.Destination); err == nil {
-		if name2 != name {
+	backend, ok := cloud.backends[info.Node]
+	if !ok {
+		return nil, asAwsError(syscall.EAGAIN)
+	}
+
+	if info2, err := cloud.getBlobInfo(param.Destination); err == nil {
+		if info2.Node != info.Node {
+			backend2, ok := cloud.backends[info2.Node]
+			if !ok {
+				return nil, asAwsError(syscall.EAGAIN)
+			}
 			_, err := backend2.DeleteBlob(&DeleteBlobInput{Key: param.Destination})
 			if err == nil {
 				if err == syscall.ENOENT {
-					return nil, asAwsRequestError(err, requestId)
+					return nil, asAwsRequestError(err, reqId)
 				}
 				return nil, asAwsError(err)
 			}
 		}
 	}
 
-	cloud.kv.Delete(context.Background(), cloud.kvBlobKey(param.Source), nil)
-
-	output, err := backend.RenameBlob(param)
+	out, err = backend.RenameBlob(param)
 	if err != nil {
 		return nil, err
 	}
 
-	cloud.kvPut(cloud.kvBlobKey(param.Destination), &name)
-	return output, nil
+	cloud.deleteBlobInfo(param.Source)
+	cloud.putBlobInfo(param.Destination, info)
+
+	return out, nil
 }
 
-func (cloud *MultiCloud) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
-	requestId := requestId()
+func (cloud *MultiCloud) CopyBlob(param *CopyBlobInput) (out *CopyBlobOutput, err error) {
+	reqId := requestId()
 
-	err := cloud.writeIntentLog(requestId, "CopyBlob", param)
+	mlog.Debugf("Enter CopyBlob, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave CopyBlob, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
+	err = cloud.putIntentLog(reqId, "CopyBlob", param)
 	if err != nil {
 		return nil, err
 	}
-	defer cloud.deleteIntentLog(requestId, "CopyBlob")
+	defer cloud.deleteIntentLog(reqId, "CopyBlob")
 
-	name, backend, err := cloud.getBlogBackend(param.Source)
+	info, err := cloud.getBlobInfo(param.Source)
 	if err != nil {
 		if err == syscall.ENOENT {
-			return nil, asAwsRequestError(err, requestId)
+			return nil, asAwsRequestError(err, reqId)
 		} else {
 			return nil, asAwsError(err)
 		}
 	}
 
-	if name2, backend2, err := cloud.getBlogBackend(param.Destination); err == nil {
-		if name2 != name {
-			_, err := backend2.DeleteBlob(&DeleteBlobInput{Key: param.Destination})
+	if info2, err := cloud.getBlobInfo(param.Destination); err == nil {
+		if info.Node != info2.Node {
+			backend, _ := cloud.backends[info2.Node]
+			_, err := backend.DeleteBlob(&DeleteBlobInput{Key: param.Destination})
 			if err == nil {
 				if err == syscall.ENOENT {
-					return nil, asAwsRequestError(err, requestId)
+					return nil, asAwsRequestError(err, reqId)
 				} else {
 					return nil, asAwsError(err)
 				}
@@ -609,38 +651,59 @@ func (cloud *MultiCloud) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error)
 		}
 	}
 
-	cloud.kvPut(cloud.kvBlobKey(param.Destination), &name)
-	return backend.CopyBlob(param)
+	backend, _ := cloud.backends[info.Node]
+
+	cloud.putBlobInfo(param.Destination, info)
+
+	out, err = backend.CopyBlob(param)
+
+	return
 }
 
-func (cloud *MultiCloud) GetBlob(param *GetBlobInput) (*GetBlobOutput, error) {
-	requestId := requestId()
-	_, backend, err := cloud.getBlogBackend(param.Key)
+func (cloud *MultiCloud) GetBlob(param *GetBlobInput) (out *GetBlobOutput, err error) {
+	reqId := requestId()
+
+	mlog.Debugf("Enter GetBlob, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave GetBlob, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
+	info, err := cloud.getBlobInfo(param.Key)
 	if err != nil {
 		if err == syscall.ENOENT {
-			return nil, asAwsRequestError(err, requestId)
+			return nil, asAwsRequestError(err, reqId)
 		}
 		return nil, asAwsError(err)
 	}
-	return backend.GetBlob(param)
+	backend := cloud.backends[info.Node]
+
+	out, err = backend.GetBlob(param)
+
+	return
 }
 
-func (cloud *MultiCloud) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
-	mlog.Debugf("PutBlob %+v", param)
+func (cloud *MultiCloud) PutBlob(param *PutBlobInput) (out *PutBlobOutput, err error) {
+	reqId := requestId()
+
+	mlog.Debugf("Enter PutBlob, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave PutBlob, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
 	name, backend, err := cloud.selectBackend(param.Key)
 	if err != nil {
 		mlog.Debugf("error %+v", err)
 		return nil, err
 	}
-	output, err := backend.PutBlob(param)
+	out, err = backend.PutBlob(param)
 	if err != nil {
 		mlog.Debugf("error %+v", err)
 		return nil, err
 	}
 	blobInfo := BlobInfo{}
 	blobInfo.Size = param.Size
-	blobInfo.Etag = output.ETag
-	blobInfo.StorageClass = output.StorageClass
+	blobInfo.Etag = out.ETag
+	blobInfo.StorageClass = out.StorageClass
 
 	now := time.Now()
 	blobInfo.LastModified = &now
@@ -652,99 +715,169 @@ func (cloud *MultiCloud) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
 		mlog.Debugf("error %+v", err)
 		return nil, err
 	}
-	return output, nil
+	return out, nil
 }
 
-func (cloud *MultiCloud) MultipartBlobBegin(param *MultipartBlobBeginInput) (*MultipartBlobCommitInput, error) {
-	mlog.Debugf("MultipartBlobBegin %+v", param)
+func (cloud *MultiCloud) MultipartBlobBegin(param *MultipartBlobBeginInput) (out *MultipartBlobCommitInput, err error) {
+	reqId := requestId()
+
+	mlog.Debugf("Enter MultiPartBlobBegin, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave MultiPartBlobBegin, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
 	name, backend, err := cloud.selectBackend(param.Key)
 	if err != nil {
 		return nil, err
 	}
 
-	output, err := backend.MultipartBlobBegin(param)
-	err = cloud.writeMultiPartNodeName(*output.UploadId, name)
+	out, err = backend.MultipartBlobBegin(param)
+	info := MultiPartUploadInfo{Node: name}
+	err = cloud.putMultiPartInfo(*out.UploadId, &info)
 	if err != nil {
-		backend.MultipartBlobAbort(output)
+		backend.MultipartBlobAbort(out)
 		return nil, err
 	}
 
-	return output, err
+	return out, err
 }
 
-func (cloud *MultiCloud) MultipartBlobAdd(param *MultipartBlobAddInput) (*MultipartBlobAddOutput, error) {
-	name, err := cloud.getMultiPartNodeName(*param.Commit.UploadId)
+func (cloud *MultiCloud) MultipartBlobAdd(param *MultipartBlobAddInput) (out *MultipartBlobAddOutput, err error) {
+	reqId := requestId()
+
+	mlog.Debugf("Enter MultiPartBlobAdd, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave MultiPartBlobAdd, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
+	info, err := cloud.getMultiPartInfo(*param.Commit.UploadId)
 	if err != nil {
 		return nil, err
 	}
-	backend, _ := cloud.backends[name]
-	return backend.MultipartBlobAdd(param)
+	backend, ok := cloud.backends[info.Node]
+	if !ok {
+		return nil, asAwsError(syscall.EAGAIN)
+	}
+	out, err = backend.MultipartBlobAdd(param)
+
+	return
 }
 
-func (cloud *MultiCloud) MultipartBlobAbort(param *MultipartBlobCommitInput) (*MultipartBlobAbortOutput, error) {
-	name, err := cloud.getMultiPartNodeName(*param.UploadId)
+func (cloud *MultiCloud) MultipartBlobAbort(param *MultipartBlobCommitInput) (out *MultipartBlobAbortOutput, err error) {
+	reqId := requestId()
+
+	mlog.Debugf("Enter MultiPartBlobAbort, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave MultiPartBlobAbort, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
+	info, err := cloud.getMultiPartInfo(*param.UploadId)
 	if err != nil {
 		return nil, err
 	}
-	backend, _ := cloud.backends[name]
+	backend, ok := cloud.backends[info.Node]
+	if !ok {
+		return nil, asAwsError(syscall.EAGAIN)
+	}
 
-	return backend.MultipartBlobAbort(param)
+	out, err = backend.MultipartBlobAbort(param)
+
+	return
 }
 
-func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (*MultipartBlobCommitOutput, error) {
-	name, err := cloud.getMultiPartNodeName(*param.UploadId)
+func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (out *MultipartBlobCommitOutput, err error) {
+	reqId := requestId()
+
+	mlog.Debugf("Enter MultiPartBlobCommit, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave MultiPartBlobCommit, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
+	info, err := cloud.getMultiPartInfo(*param.UploadId)
 	if err != nil {
 		return nil, err
 	}
-	backend, _ := cloud.backends[name]
+	backend, ok := cloud.backends[info.Node]
+	if !ok {
+		return nil, asAwsError(syscall.EAGAIN)
+	}
 
-	output, err := backend.MultipartBlobCommit(param)
+	out, err = backend.MultipartBlobCommit(param)
 	if err != nil {
 		return nil, err
 	}
 
 	blobInfo := &BlobInfo{}
-	blobInfo.Etag = output.ETag
-	blobInfo.Node = name
+	blobInfo.Etag = out.ETag
+	blobInfo.Node = info.Node
 
 	key := cloud.kvBlobKey(*param.Key)
 	cloud.kvPut(key, &blobInfo)
 
-	return output, nil
+	err = nil
+
+	return out, err
 }
 
-func (cloud *MultiCloud) MultipartExpire(param *MultipartExpireInput) (*MultipartExpireOutput, error) {
+func (cloud *MultiCloud) MultipartExpire(param *MultipartExpireInput) (out *MultipartExpireOutput, err error) {
+	reqId := requestId()
+
+	mlog.Debugf("Enter MultiPartExpire, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave MultiPartExipre, %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
 	for _, backend := range cloud.backends {
 		backend.MultipartExpire(param)
 	}
 
-	return &MultipartExpireOutput{}, nil
+	out = &MultipartExpireOutput{}
+	err = nil
+
+	return
 }
 
-func (cloud *MultiCloud) RemoveBucket(param *RemoveBucketInput) (*RemoveBucketOutput, error) {
-	mlog.Debugf("RemoveBucket %+v", param)
-	requestId := requestId()
-	err := cloud.writeIntentLog(requestId, "RemoveBucket", param)
+func (cloud *MultiCloud) RemoveBucket(param *RemoveBucketInput) (out *RemoveBucketOutput, err error) {
+	reqId := requestId()
+
+	mlog.Debugf("Enter RemoveBucket, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave RemoveBucket, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
+	err = cloud.putIntentLog(reqId, "RemoveBucket", param)
 	if err != nil {
 		return nil, err
 	}
-	defer cloud.deleteIntentLog(requestId, "RemoveBucket")
+	defer cloud.deleteIntentLog(reqId, "RemoveBucket")
 
 	for _, backend := range cloud.backends {
 		backend.RemoveBucket(param)
 	}
-	return &RemoveBucketOutput{RequestId: requestId}, nil
+	out = &RemoveBucketOutput{RequestId: reqId}
+	err = nil
+
+	return
 }
 
-func (cloud *MultiCloud) MakeBucket(param *MakeBucketInput) (*MakeBucketOutput, error) {
-	mlog.Debugf("MakeBucket %+v", param)
-	requestId := requestId()
-	err := cloud.writeIntentLog(requestId, "CreateBucket", param)
+func (cloud *MultiCloud) MakeBucket(param *MakeBucketInput) (out *MakeBucketOutput, err error) {
+	reqId := requestId()
+
+	mlog.Debugf("Enter MakeBucket, param %+v, reqId %s", param, reqId)
+	defer func() {
+		mlog.Debugf("Leave MakeBucket, out %+v, err %v, reqId %s", out, err, reqId)
+	}()
+
+	err = cloud.putIntentLog(reqId, "CreateBucket", param)
 	if err != nil {
 		return nil, err
 	}
 	for _, backend := range cloud.backends {
 		backend.MakeBucket(param)
 	}
-	return &MakeBucketOutput{RequestId: requestId}, nil
+
+	out = &MakeBucketOutput{RequestId: reqId}
+	err = nil
+
+	return
 }
