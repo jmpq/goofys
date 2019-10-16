@@ -68,6 +68,9 @@ TUNING OPTIONS:
 AWS S3 OPTIONS:
    {{range category .Flags "aws"}}{{.}}
    {{end}}
+MultiCloud Options:
+   {{range category .Flags "multi"}}{{.}}
+   {{end}}
 MISC OPTIONS:
    {{range category .Flags "misc"}}{{.}}
    {{end}}{{end}}{{if .Copyright }}
@@ -247,19 +250,23 @@ func NewApp() (app *cli.App) {
 			// Debugging
 			/////////////////////////
 
-			cli.BoolFlag{
-				Name:  "debug_fuse",
-				Usage: "Enable fuse-related debugging output.",
-			},
-
-			cli.BoolFlag{
-				Name:  "debug_s3",
-				Usage: "Enable S3-related debugging output.",
+			cli.StringFlag{
+				Name:  "debug-mods",
+				Usage: "Enable debugging output for modules.",
 			},
 
 			cli.BoolFlag{
 				Name:  "f",
 				Usage: "Run goofys in foreground.",
+			},
+
+			//////////////////////////
+			// MultiCloud
+			//////////////////////////
+			cli.StringFlag{
+				Name:  "etcd",
+				Usage: "Etcd endpoints",
+				Value: "http://127.0.0.1:2379",
 			},
 		},
 	}
@@ -279,8 +286,12 @@ func NewApp() (app *cli.App) {
 		flagCategories[f] = "tuning"
 	}
 
-	for _, f := range []string{"help, h", "debug_fuse", "debug_s3", "version, v", "f"} {
+	for _, f := range []string{"help, h", "debug-mods", "version, v", "f"} {
 		flagCategories[f] = "misc"
+	}
+
+	for _, f := range []string{"etcd"} {
+		flagCategories[f] = "multi"
 	}
 
 	cli.HelpPrinter = func(w io.Writer, templ string, data interface{}) {
@@ -338,10 +349,15 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		UseContentType: c.Bool("use-content-type"),
 
 		// Debugging,
-		DebugFuse:  c.Bool("debug_fuse"),
-		DebugS3:    c.Bool("debug_s3"),
+		DebugMods:  c.String("debug-mods"),
 		Foreground: c.Bool("f"),
+
+		// MultiCloud
+		EtcdEndpoints: c.String("etcd"),
 	}
+
+	flags.DebugS3 = strings.Contains(flags.DebugMods, "s3")
+	flags.DebugFuse = strings.Contains(flags.DebugMods, "fuse")
 
 	// S3
 	if c.IsSet("region") || c.IsSet("requester-pays") || c.IsSet("storage-class") ||

@@ -31,6 +31,7 @@ var loggers = make(map[string]*LogHandle)
 
 var log = GetLogger("main")
 var cloudLogLevel = logrus.InfoLevel
+var debugMods string
 
 var syslogHook *logrus_syslog.SyslogHook
 
@@ -57,6 +58,15 @@ func SetCloudLogLevel(level logrus.Level) {
 	for k, logr := range loggers {
 		if k != "main" && k != "fuse" {
 			logr.Level = level
+		}
+	}
+}
+
+func SetDebugMods(mods string) {
+	debugMods = mods
+	for k, logr := range loggers {
+		if strings.Contains(debugMods, k) {
+			logr.Level = logrus.DebugLevel
 		}
 	}
 }
@@ -113,23 +123,25 @@ func NewLogger(name string) *LogHandle {
 	return l
 }
 
-func GetLogger(name string) *LogHandle {
+func GetLogger(name string) (logger *LogHandle) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if logger, ok := loggers[name]; ok {
-		if name != "main" && name != "fuse" {
-			logger.Level = cloudLogLevel
-		}
-		return logger
-	} else {
-		logger := NewLogger(name)
+	logger, ok := loggers[name]
+	if !ok {
+		logger = NewLogger(name)
 		loggers[name] = logger
-		if name != "main" && name != "fuse" {
-			logger.Level = cloudLogLevel
-		}
-		return logger
 	}
+
+	fmt.Printf("xxxx %s %s\n", debugMods, name)
+
+	if strings.Contains(debugMods, name) {
+		logger.Level = logrus.DebugLevel
+	} else {
+		logger.Level = logrus.InfoLevel
+	}
+
+	return logger
 }
 
 func GetStdLogger(l *LogHandle, lvl logrus.Level) *glog.Logger {

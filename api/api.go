@@ -22,6 +22,7 @@ func Mount(
 	bucketName string,
 	flags *FlagStorage) (fs *Goofys, mfs *fuse.MountedFileSystem, err error) {
 
+	SetDebugMods(flags.DebugMods)
 	if flags.DebugS3 {
 		SetCloudLogLevel(logrus.DebugLevel)
 	}
@@ -106,6 +107,14 @@ func Mount(
 				if spec.Prefix != "" {
 					bucketName += ":" + spec.Prefix
 				}
+			case "multi":
+				config, err := NewMultiCloudConfig(flags.Endpoint, spec.Bucket)
+				if err != nil {
+					return nil, nil, err
+				}
+
+				flags.Backend = config
+				bucketName = spec.Bucket
 			}
 		}
 	}

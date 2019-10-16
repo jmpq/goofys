@@ -50,9 +50,13 @@ type FlagStorage struct {
 	HTTPTimeout  time.Duration
 
 	// Debugging
-	DebugFuse  bool
+	DebugMods  string
 	DebugS3    bool
+	DebugFuse  bool
 	Foreground bool
+
+	// MultiCloud
+	EtcdEndpoints string
 }
 
 func (flags *FlagStorage) GetMimeType(fileName string) (retMime *string) {
