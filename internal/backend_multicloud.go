@@ -872,11 +872,20 @@ func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (o
 	}
 
 	blobInfo := &BlobInfo{}
-	blobInfo.Etag = out.ETag
-	blobInfo.Node = info.Node
+	output, err := backend.HeadBlob(&HeadBlobInput{Key: *param.Key})
+	if err == nil {
+		blobInfo.Size = &output.Size
+		blobInfo.Etag = output.ETag
+		blobInfo.LastModified = output.LastModified
+		blobInfo.StorageClass = output.StorageClass
+	} else {
+		blobInfo.Etag = out.ETag
+		blobInfo.Node = info.Node
+	}
 
 	key := cloud.kvBlobKey(*param.Key)
 	cloud.kvPut(key, &blobInfo)
+	cloud.deleteMultiPartInfo(*param.UploadId)
 
 	err = nil
 
