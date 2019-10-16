@@ -28,7 +28,6 @@ type MultiCloud struct {
 	bucket           string
 	cap              Capabilities
 	kv               *clientv3.Client
-	requestIDs       map[string]interface{}
 	backendNodes     []string
 	deadBackendNodes []string
 	backendStatus    map[string]bool
@@ -209,6 +208,7 @@ func (cloud *MultiCloud) getBackendChecked(node string) (StorageBackend, error) 
 	cloud.mutex.RLock()
 	defer cloud.mutex.RUnlock()
 
+	mlog.Debugf("node %s backendStatus %+v\n", node, cloud.backendStatus)
 	healthy, ok := cloud.backendStatus[node]
 	if !ok {
 		return nil, syscall.ENOENT
@@ -292,12 +292,12 @@ func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, err
 		var resp *clientv3.GetResponse
 		var err error
 		if nextToken != nil {
-			resp, err = cloud.kv.Get(ctx, cloud.kvBlobKey(*nextToken),
+			resp, err = cloud.kv.Get(ctx, *nextToken,
 				clientv3.WithFromKey(),
 				clientv3.WithLimit(50),
 				clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
 		} else if param.ContinuationToken != nil {
-			resp, err = cloud.kv.Get(ctx, cloud.kvBlobKey(*param.ContinuationToken),
+			resp, err = cloud.kv.Get(ctx, *param.ContinuationToken,
 				clientv3.WithFromKey(),
 				clientv3.WithLimit(50),
 				clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
@@ -307,11 +307,14 @@ func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, err
 				clientv3.WithLimit(50),
 				clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
 		} else {
-			mlog.Debugf("No ContinuationToken neither Prefix")
-			return nil, syscall.EINVAL
+			resp, err = cloud.kv.Get(ctx, cloud.kvBlobKey(""),
+				clientv3.WithPrefix(),
+				clientv3.WithLimit(50),
+				clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
 		}
+
 		if err != nil {
-			mlog.Debugf("ListBlobs Got error %+v", err)
+			mlog.Debugf("ListBlobs error %+v", err)
 			return nil, err
 		}
 
@@ -323,11 +326,17 @@ func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, err
 			var subKey string
 			key := string(kv.Key)
 
-			mlog.Debugf("key => %s, value => %s", key, kv.Value)
+			if !strings.HasPrefix(key, cloud.kvBlobKey("")) {
+				continue
+			}
 			key = strings.TrimPrefix(key, cloud.kvBlobKey(""))
 			delimiterIndex := -1
 
+			mlog.Debugf("key => %s, value => %s", key, kv.Value)
 			if param.Prefix != nil {
+				if !strings.HasPrefix(key, *param.Prefix) {
+					continue
+				}
 				subKey = strings.TrimPrefix(key, *param.Prefix)
 			} else {
 				subKey = key
@@ -340,6 +349,9 @@ func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, err
 			if delimiterIndex != -1 {
 				// This key is a prefix
 				prefix := subKey[:delimiterIndex+1]
+				if param.Prefix != nil {
+					prefix = *param.Prefix + prefix
+				}
 				if cnt, ok := prefixes[prefix]; ok {
 					prefixes[prefix] = cnt + 1
 				} else {
@@ -370,6 +382,8 @@ func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, err
 		if !resp.More {
 			goto out
 		} else {
+			token := string(resp.Kvs[len(resp.Kvs)-1].Key)
+			nextToken = &token
 		}
 	}
 out:
@@ -381,7 +395,20 @@ out:
 		info := blobInfos[item]
 		if info.Size == nil {
 			size := uint64(0)
-			info.Size = &size
+
+			out, e := cloud.HeadBlob(&HeadBlobInput{Key: item})
+			if e == nil {
+				size = out.Size
+
+				info.Size = &size
+				info.Etag = out.ETag
+				info.LastModified = out.LastModified
+				info.StorageClass = out.StorageClass
+
+				cloud.putBlobInfo(item, info)
+			} else {
+				info.Size = &size
+			}
 		}
 		i := item
 		output.Items = append(output.Items,
@@ -393,7 +420,8 @@ out:
 	}
 
 	for prefix, _ := range prefixes {
-		output.Prefixes = append(output.Prefixes, BlobPrefixOutput{&prefix})
+		p := prefix
+		output.Prefixes = append(output.Prefixes, BlobPrefixOutput{&p})
 	}
 
 	return output, nil
@@ -460,23 +488,20 @@ func (cloud *MultiCloud) HeadBlob(param *HeadBlobInput) (out *HeadBlobOutput, er
 
 	mlog.Debugf("Enter HeadBlob %+v, reqId %s", param, reqId)
 	defer func() {
-		mlog.Debugf("Leave HeadBlog out %v, error %v, reqId %s", out, err, reqId)
+		mlog.Debugf("Leave HeadBlog out %+v, error %v, reqId %s", out, err, reqId)
 	}()
 
 	info, err := cloud.getBlobInfo(param.Key)
 	if err != nil {
-		mlog.Debugf("Failed to get backend error %+v", err)
-		if err == syscall.ENOENT {
-			return nil, asAwsRequestError(err, reqId)
-		}
-		return nil, asAwsError(err)
+		mlog.Debugf("Failed to get blobInfo error %+v, reqId %s", err, reqId)
+		err = asAwsRequestError(err, reqId)
+		return
 	}
 	backend, err := cloud.getBackendChecked(info.Node)
 	if err != nil {
-		err = asAwsError(err)
+		err = asAwsRequestError(err, reqId)
 		return
 	}
-	mlog.Debugf("Got backend %+v", backend)
 
 	out, err = backend.HeadBlob(param)
 
@@ -506,7 +531,11 @@ func (cloud *MultiCloud) ListBlobs(param *ListBlobsInput) (out *ListBlobsOutput,
 	if param.MaxKeys != nil {
 		mlog.Debugf("    maxKeys %v", *param.MaxKeys)
 	}
+
 	out, err = cloud.listBlobs(param)
+	if err != nil {
+		err = asAwsRequestError(err, reqId)
+	}
 
 	return
 }
@@ -527,15 +556,13 @@ func (cloud *MultiCloud) DeleteBlob(param *DeleteBlobInput) (out *DeleteBlobOutp
 
 	info, err := cloud.getBlobInfo(param.Key)
 	if err != nil {
-		if err == syscall.ENOENT {
-			return nil, asAwsRequestError(err, reqId)
-		}
-		return nil, asAwsError(err)
+		err = asAwsRequestError(err, reqId)
+		return
 	}
 
 	backend, err := cloud.getBackendChecked(info.Node)
 	if err != nil {
-		err = asAwsError(err)
+		err = asAwsRequestError(err, reqId)
 		return
 	}
 
@@ -560,12 +587,10 @@ func (cloud *MultiCloud) DeleteBlobs(param *DeleteBlobsInput) (out *DeleteBlobsO
 
 	itemsMap := make(map[string][]string)
 	for _, item := range param.Items {
-		info, err := cloud.getBlobInfo(item)
-		if err != nil {
-			if err == syscall.ENOENT {
-				return nil, asAwsRequestError(err, reqId)
-			}
-			return nil, asAwsError(err)
+		info, e := cloud.getBlobInfo(item)
+		if e != nil {
+			err = asAwsRequestError(e, reqId)
+			return
 		}
 		if l, ok := itemsMap[info.Node]; ok {
 			itemsMap[info.Node] = append(l, item)
@@ -577,16 +602,14 @@ func (cloud *MultiCloud) DeleteBlobs(param *DeleteBlobsInput) (out *DeleteBlobsO
 	for name, items := range itemsMap {
 		backend, e := cloud.getBackendChecked(name)
 		if e != nil {
-			err = asAwsError(e)
+			err = asAwsRequestError(e, reqId)
 			return
 		}
 		input := &DeleteBlobsInput{Items: items}
-		_, err := backend.DeleteBlobs(input)
-		if err != nil {
-			if err == syscall.ENOENT {
-				return nil, asAwsRequestError(err, reqId)
-			}
-			return nil, asAwsError(err)
+		_, e = backend.DeleteBlobs(input)
+		if e != nil {
+			err = asAwsRequestError(e, reqId)
+			return
 		}
 	}
 
@@ -612,15 +635,13 @@ func (cloud *MultiCloud) RenameBlob(param *RenameBlobInput) (out *RenameBlobOutp
 
 	info, err := cloud.getBlobInfo(param.Source)
 	if err != nil {
-		if err == syscall.ENOENT {
-			return nil, asAwsRequestError(err, reqId)
-		}
-		return nil, asAwsError(err)
+		err = asAwsRequestError(err, reqId)
+		return
 	}
 
 	backend, e := cloud.getBackendChecked(info.Node)
 	if e != nil {
-		err = asAwsError(e)
+		err = asAwsRequestError(e, reqId)
 		return
 	}
 
@@ -628,15 +649,13 @@ func (cloud *MultiCloud) RenameBlob(param *RenameBlobInput) (out *RenameBlobOutp
 		if info2.Node != info.Node {
 			backend2, e := cloud.getBackendChecked(info2.Node)
 			if e != nil {
-				err = asAwsError(e)
+				err = asAwsRequestError(e, reqId)
 				return
 			}
-			_, err := backend2.DeleteBlob(&DeleteBlobInput{Key: param.Destination})
+			_, err = backend2.DeleteBlob(&DeleteBlobInput{Key: param.Destination})
 			if err == nil {
-				if err == syscall.ENOENT {
-					return nil, asAwsRequestError(err, reqId)
-				}
-				return nil, asAwsError(err)
+				err = asAwsRequestError(err, reqId)
+				return
 			}
 		}
 	}
@@ -668,36 +687,28 @@ func (cloud *MultiCloud) CopyBlob(param *CopyBlobInput) (out *CopyBlobOutput, er
 
 	info, err := cloud.getBlobInfo(param.Source)
 	if err != nil {
-		if err == syscall.ENOENT {
-			return nil, asAwsRequestError(err, reqId)
-		} else {
-			return nil, asAwsError(err)
-		}
+		err = asAwsRequestError(err, reqId)
+		return
 	}
 
 	if info2, e := cloud.getBlobInfo(param.Destination); e == nil {
 		if info.Node != info2.Node {
 			backend2, e := cloud.getBackendChecked(info2.Node)
 			if e != nil {
-				err = asAwsError(e)
+				err = asAwsRequestError(e, reqId)
 				return
 			}
 			_, e = backend2.DeleteBlob(&DeleteBlobInput{Key: param.Destination})
 			if e == nil {
-				if e == syscall.ENOENT {
-					err = e
-					return
-				} else {
-					err = asAwsError(err)
-					return
-				}
+				err = asAwsRequestError(err, reqId)
+				return
 			}
 		}
 	}
 
 	backend, e := cloud.getBackendChecked(info.Node)
 	if e != nil {
-		err = asAwsError(e)
+		err = asAwsRequestError(err, reqId)
 		return
 	}
 
@@ -718,14 +729,12 @@ func (cloud *MultiCloud) GetBlob(param *GetBlobInput) (out *GetBlobOutput, err e
 
 	info, err := cloud.getBlobInfo(param.Key)
 	if err != nil {
-		if err == syscall.ENOENT {
-			return nil, asAwsRequestError(err, reqId)
-		}
-		return nil, asAwsError(err)
+		err = asAwsRequestError(err, reqId)
+		return
 	}
 	backend, e := cloud.getBackendChecked(info.Node)
 	if e != nil {
-		err = asAwsError(e)
+		err = asAwsRequestError(e, reqId)
 		return
 	}
 
@@ -808,7 +817,7 @@ func (cloud *MultiCloud) MultipartBlobAdd(param *MultipartBlobAddInput) (out *Mu
 	}
 	backend, e := cloud.getBackendChecked(info.Node)
 	if e != nil {
-		err = asAwsError(e)
+		err = asAwsRequestError(e, reqId)
 		return
 	}
 	out, err = backend.MultipartBlobAdd(param)
@@ -830,7 +839,7 @@ func (cloud *MultiCloud) MultipartBlobAbort(param *MultipartBlobCommitInput) (ou
 	}
 	backend, e := cloud.getBackendChecked(info.Node)
 	if e != nil {
-		err = asAwsError(e)
+		err = asAwsRequestError(e, reqId)
 		return
 	}
 
@@ -853,7 +862,8 @@ func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (o
 	}
 	backend, ok := cloud.backends[info.Node]
 	if !ok {
-		return nil, asAwsError(syscall.EAGAIN)
+		err = asAwsRequestError(syscall.EAGAIN, reqId)
+		return
 	}
 
 	out, err = backend.MultipartBlobCommit(param)
