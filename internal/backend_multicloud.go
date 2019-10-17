@@ -70,6 +70,14 @@ func asAwsRequestError(err error, reqId string) awserr.RequestFailure {
 		awserr.New("", "", err), httpStatusCode(err), reqId)
 }
 
+func derefString(pointer *string) string {
+	if pointer != nil {
+		return *pointer
+	} else {
+		return "<nil>"
+	}
+}
+
 func NewMultiCloud(bucket string, flags *FlagStorage, config *MultiCloudConfig) (*MultiCloud, error) {
 	kvdb, err := NewEtcdDB(flags.EtcdEndpoints, false)
 	if err != nil {
@@ -805,7 +813,8 @@ func (cloud *MultiCloud) MultipartBlobAdd(param *MultipartBlobAddInput) (out *Mu
 
 	info, err := cloud.getMultiPartInfo(*param.Commit.UploadId)
 	if err != nil {
-		mlog.Errorf("Failed to get multipart info for %s, error %v, reqId %s", *param.Commit.Key, err, reqId)
+		mlog.Errorf("Failed to get multipart info for %s, error %v, reqId %s",
+			derefString(param.Commit.Key), err, reqId)
 		return
 	}
 	backend, e := cloud.getBackendChecked(info.Node)
@@ -825,7 +834,8 @@ func (cloud *MultiCloud) MultipartBlobAdd(param *MultipartBlobAddInput) (out *Mu
 func (cloud *MultiCloud) MultipartBlobAbort(param *MultipartBlobCommitInput) (out *MultipartBlobAbortOutput, err error) {
 	reqId := requestId()
 
-	mlog.Debugf("Enter MultiPartBlobAbort, UploadId %s, Key %s, reqId %s", *param.UploadId, *param.Key, reqId)
+	mlog.Debugf("Enter MultiPartBlobAbort, UploadId %s, Key %s, reqId %s",
+		derefString(param.UploadId), derefString(param.Key), reqId)
 	defer func() {
 		mlog.Debugf("Leave MultiPartBlobAbort, out %+v, err %v, reqId %s", out, err, reqId)
 	}()
@@ -848,14 +858,17 @@ func (cloud *MultiCloud) MultipartBlobAbort(param *MultipartBlobCommitInput) (ou
 func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (out *MultipartBlobCommitOutput, err error) {
 	reqId := requestId()
 
-	mlog.Debugf("Enter MultiPartBlobCommit, uploadId %s, key %s, reqId %s", *param.UploadId, *param.Key, reqId)
+	mlog.Debugf("Enter MultiPartBlobCommit, uploadId %s, key %s, reqId %s",
+		derefString(param.UploadId), derefString(param.Key), reqId)
 	defer func() {
 		mlog.Debugf("Leave MultiPartBlobCommit, out %+v, err %v, reqId %s", out, err, reqId)
 	}()
 
-	info, err := cloud.getMultiPartInfo(*param.UploadId)
+	info, err := cloud.getMultiPartInfo(derefString(param.UploadId))
 	if err != nil {
-		return nil, err
+		mlog.Errorf("Failed to get multiPart upload info for %s, reqId %s",
+			derefString(param.UploadId), reqId)
+		return
 	}
 
 	backend, err := cloud.getBackendChecked(info.Node)
@@ -867,7 +880,7 @@ func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (o
 
 	out, err = backend.MultipartBlobCommit(param)
 	if err != nil {
-		mlog.Errorf("Failed to commit blob upload for %s, reqId %s", *param.Key, reqId)
+		mlog.Errorf("Failed to commit blob upload for %s, reqId %s", derefString(param.Key), reqId)
 		return
 	}
 
