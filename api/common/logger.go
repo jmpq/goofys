@@ -133,8 +133,6 @@ func GetLogger(name string) (logger *LogHandle) {
 		loggers[name] = logger
 	}
 
-	fmt.Printf("xxxx %s %s\n", debugMods, name)
-
 	if strings.Contains(debugMods, name) {
 		logger.Level = logrus.DebugLevel
 	} else {

@@ -3,7 +3,6 @@
 package internal
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +16,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	. "github.com/kahing/goofys/api/common"
 	uuid "github.com/satori/go.uuid"
-	"go.etcd.io/etcd/clientv3"
 )
 
 var mlog = GetLogger("multi")
@@ -27,7 +25,7 @@ type MultiCloud struct {
 	backends         map[string]StorageBackend
 	bucket           string
 	cap              Capabilities
-	kv               *clientv3.Client
+	kv               KVDB
 	backendNodes     []string
 	deadBackendNodes []string
 	backendStatus    map[string]bool
@@ -73,11 +71,7 @@ func asAwsRequestError(err error, reqId string) awserr.RequestFailure {
 }
 
 func NewMultiCloud(bucket string, flags *FlagStorage, config *MultiCloudConfig) (*MultiCloud, error) {
-	cfg := clientv3.Config{
-		Endpoints:   strings.Split(flags.EtcdEndpoints, ","),
-		DialTimeout: 5 * time.Second,
-	}
-	c, err := clientv3.New(cfg)
+	kvdb, err := NewEtcdDB(flags.EtcdEndpoints, false)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +79,7 @@ func NewMultiCloud(bucket string, flags *FlagStorage, config *MultiCloudConfig) 
 	cloud := &MultiCloud{
 		bucket:        bucket,
 		cap:           Capabilities{Name: "s3"},
-		kv:            c,
+		kv:            kvdb,
 		backends:      make(map[string]StorageBackend),
 		backendStatus: make(map[string]bool),
 	}
@@ -237,28 +231,22 @@ func (cloud *MultiCloud) kvPut(key string, value interface{}) error {
 	if err != nil {
 		return err
 	}
-	_, err = cloud.kv.Put(context.TODO(), key, string(bytes))
+	err = cloud.kv.Set(key, bytes)
+
 	return err
 }
 
 func (cloud *MultiCloud) kvGet(key string, value interface{}) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	resp, err := cloud.kv.Get(ctx, key)
-	defer cancel()
+	bytes, err := cloud.kv.Get(key)
 	if err != nil {
 		return err
 	}
-	if len(resp.Kvs) == 0 {
-		return syscall.ENOENT
-	}
 
-	return json.Unmarshal([]byte(resp.Kvs[0].Value), value)
+	return json.Unmarshal(bytes, value)
 }
 
 func (cloud *MultiCloud) kvDelete(key string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_, err := cloud.kv.Delete(ctx, key)
+	err := cloud.kv.Delete(key)
 	return err
 }
 
@@ -278,68 +266,63 @@ func (cloud *MultiCloud) deleteBlobInfo(key string) error {
 }
 
 func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	count := 0
 	items := []string{}
 	prefixes := make(map[string]int)
 	blobInfos := make(map[string]*BlobInfo)
 	output := &ListBlobsOutput{}
-	var nextToken *string
 
+	prefix := cloud.kvBlobKey("")
+	if param.Prefix != nil {
+		prefix = cloud.kvBlobKey(*param.Prefix)
+	}
+	var start *string = nil
+	if param.ContinuationToken != nil {
+		start = param.ContinuationToken
+	}
+
+	maxKeys := 10000000000
+	if param.MaxKeys != nil {
+		maxKeys = int(*param.MaxKeys)
+	}
+
+	iteration := 0
 	for {
-		var resp *clientv3.GetResponse
-		var err error
-		if nextToken != nil {
-			resp, err = cloud.kv.Get(ctx, *nextToken,
-				clientv3.WithFromKey(),
-				clientv3.WithLimit(50),
-				clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
-		} else if param.ContinuationToken != nil {
-			resp, err = cloud.kv.Get(ctx, *param.ContinuationToken,
-				clientv3.WithFromKey(),
-				clientv3.WithLimit(50),
-				clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
-		} else if param.Prefix != nil {
-			resp, err = cloud.kv.Get(ctx, cloud.kvBlobKey(*param.Prefix),
-				clientv3.WithPrefix(),
-				clientv3.WithLimit(50),
-				clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
-		} else {
-			resp, err = cloud.kv.Get(ctx, cloud.kvBlobKey(""),
-				clientv3.WithPrefix(),
-				clientv3.WithLimit(50),
-				clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+		// scan keys from start key, limit 100, with prefix
+		s := ""
+		if start != nil {
+			s = *start
 		}
 
-		if err != nil {
-			mlog.Debugf("ListBlobs error %+v", err)
-			return nil, err
-		}
-
-		if len(resp.Kvs) == 0 {
+		kvs, err := cloud.kv.Scan(&prefix, start, 100)
+		if err != nil || len(kvs) == 0 {
+			if err != nil {
+				mlog.Debugf("ListBlobs error %+v", err)
+				err = nil
+			}
+			mlog.Printf("prefix %s, start %v, got 0 items", prefix, s)
 			goto out
 		}
+		mlog.Printf("prefix %s, start %v, got %d items", prefix, s, len(kvs))
 
-		for _, kv := range resp.Kvs {
+		for _, kv := range kvs {
 			var subKey string
 			key := string(kv.Key)
 
-			if !strings.HasPrefix(key, cloud.kvBlobKey("")) {
-				continue
+			if maxKeys == 0 {
+				output.NextContinuationToken = &key
+				output.IsTruncated = true
+				goto out
 			}
-			key = strings.TrimPrefix(key, cloud.kvBlobKey(""))
+
+			blobKey := strings.TrimPrefix(key, cloud.kvBlobKey(""))
 			delimiterIndex := -1
 
-			mlog.Debugf("key => %s, value => %s", key, kv.Value)
+			//mlog.Debugf("blogKey => %s, value => %s", blobKey, kv.Value)
+
 			if param.Prefix != nil {
-				if !strings.HasPrefix(key, *param.Prefix) {
-					continue
-				}
-				subKey = strings.TrimPrefix(key, *param.Prefix)
+				subKey = strings.TrimPrefix(blobKey, *param.Prefix)
 			} else {
-				subKey = key
+				subKey = blobKey
 			}
 
 			if param.Delimiter != nil {
@@ -355,37 +338,32 @@ func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, err
 				if cnt, ok := prefixes[prefix]; ok {
 					prefixes[prefix] = cnt + 1
 				} else {
-					count++
-					if param.MaxKeys != nil && count > int(*param.MaxKeys) {
-						output.NextContinuationToken = &key
-						output.IsTruncated = true
-						goto out
-					}
 					prefixes[prefix] = 1
+					maxKeys--
 				}
-			} else {
-				// This key is not a prefix
-				count++
-				if param.MaxKeys != nil && count > int(*param.MaxKeys) {
-					output.NextContinuationToken = &key
-					output.IsTruncated = true
-					goto out
-				}
-				items = append(items, key)
+				nextKey := cloud.kvBlobKey(prefix)
+				bytes := []byte(nextKey)
+				bytes[len(bytes)-1]++
+				nextKey = string(bytes)
 
+				start = &nextKey
+			} else {
+				// This key is an item
 				var info BlobInfo
+
+				items = append(items, blobKey)
+
 				json.Unmarshal(kv.Value, &info)
-				blobInfos[key] = &info
+				blobInfos[blobKey] = &info
+				maxKeys--
+
+				nextKey := key + " "
+				start = &nextKey
 			}
 		}
-
-		if !resp.More {
-			goto out
-		} else {
-			token := string(resp.Kvs[len(resp.Kvs)-1].Key)
-			nextToken = &token
-		}
+		iteration++
 	}
+
 out:
 	sort.Strings(items)
 
@@ -435,7 +413,7 @@ func (cloud *MultiCloud) putIntentLog(reqId string, op string, param interface{}
 
 func (cloud *MultiCloud) deleteIntentLog(reqId string, op string) error {
 	key := cloud.kvIntentKey(reqId, op)
-	_, err := cloud.kv.Delete(context.Background(), key, nil)
+	err := cloud.kv.Delete(key)
 	return err
 }
 
@@ -447,7 +425,7 @@ func (cloud *MultiCloud) putMultiPartInfo(uploadId string, info *MultiPartUpload
 
 func (cloud *MultiCloud) deleteMultiPartInfo(uploadId string) error {
 	key := "multipart/" + uploadId
-	_, err := cloud.kv.Delete(context.Background(), key, nil)
+	err := cloud.kv.Delete(key)
 	return err
 }
 
@@ -883,9 +861,10 @@ func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (o
 		blobInfo.Node = info.Node
 	}
 
-	key := cloud.kvBlobKey(*param.Key)
-	cloud.kvPut(key, &blobInfo)
-	cloud.deleteMultiPartInfo(*param.UploadId)
+	cloud.putBlobInfo(*param.Key, blobInfo)
+	if param.UploadId != nil {
+		cloud.deleteMultiPartInfo(*param.UploadId)
+	}
 
 	err = nil
 
