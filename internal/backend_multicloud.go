@@ -202,7 +202,7 @@ func (cloud *MultiCloud) getBackendChecked(node string) (StorageBackend, error) 
 	cloud.mutex.RLock()
 	defer cloud.mutex.RUnlock()
 
-	mlog.Debugf("node %s backendStatus %+v\n", node, cloud.backendStatus)
+	mlog.Debugf("node %s backendStatus %+v", node, cloud.backendStatus)
 	healthy, ok := cloud.backendStatus[node]
 	if !ok {
 		return nil, syscall.ENOENT
@@ -468,16 +468,18 @@ func (cloud *MultiCloud) HeadBlob(param *HeadBlobInput) (out *HeadBlobOutput, er
 
 	info, err := cloud.getBlobInfo(param.Key)
 	if err != nil {
-		mlog.Debugf("Failed to get blobInfo error %+v, reqId %s", err, reqId)
+		mlog.Debugf("Failed to get blobInfo for %s error %+v, reqId %s", param.Key, err, reqId)
 		err = asAwsRequestError(err, reqId)
 		return
 	}
 	backend, err := cloud.getBackendChecked(info.Node)
 	if err != nil {
+		mlog.Debugf("Failed to get backend for %s, reqId %s", info.Node, reqId)
 		err = asAwsRequestError(err, reqId)
 		return
 	}
 
+	mlog.Debugf("Got backend %s for %s, reqId %s", info.Node, param.Key, reqId)
 	out, err = backend.HeadBlob(param)
 
 	return
@@ -542,6 +544,9 @@ func (cloud *MultiCloud) DeleteBlob(param *DeleteBlobInput) (out *DeleteBlobOutp
 	}
 
 	out, err = backend.DeleteBlob(param)
+	if err != nil {
+		cloud.kvDelete(param.Key)
+	}
 
 	return
 }
@@ -585,6 +590,10 @@ func (cloud *MultiCloud) DeleteBlobs(param *DeleteBlobsInput) (out *DeleteBlobsO
 		if e != nil {
 			err = asAwsRequestError(e, reqId)
 			return
+		}
+
+		for _, item := range items {
+			cloud.kvDelete(item)
 		}
 	}
 
@@ -759,23 +768,31 @@ func (cloud *MultiCloud) MultipartBlobBegin(param *MultipartBlobBeginInput) (out
 
 	mlog.Debugf("Enter MultiPartBlobBegin, param %+v, reqId %s", param, reqId)
 	defer func() {
-		mlog.Debugf("Leave MultiPartBlobBegin, out uploadId %s, err %v, reqId %s", out.UploadId, err, reqId)
+		mlog.Debugf("Leave MultiPartBlobBegin, err %v, reqId %s", err, reqId)
 	}()
 
 	name, backend, err := cloud.selectBackend(param.Key)
 	if err != nil {
-		return nil, err
+		mlog.Errorf("Failed to find backend for %s, reqId %s", param.Key, reqId)
+		return
 	}
 
 	out, err = backend.MultipartBlobBegin(param)
-	info := MultiPartUploadInfo{Node: name}
-	err = cloud.putMultiPartInfo(*out.UploadId, &info)
 	if err != nil {
-		backend.MultipartBlobAbort(out)
-		return nil, err
+		mlog.Errorf("Failed to begin multipart upload for %s, reqId %s", param.Key, reqId)
+		return
 	}
 
-	return out, err
+	info := MultiPartUploadInfo{Node: name}
+
+	err = cloud.putMultiPartInfo(*out.UploadId, &info)
+	if err != nil {
+		mlog.Errorf("Failed to put multipart upload information for %s, reqId %s", param.Key, reqId)
+		backend.MultipartBlobAbort(out)
+		return
+	}
+
+	return
 }
 
 func (cloud *MultiCloud) MultipartBlobAdd(param *MultipartBlobAddInput) (out *MultipartBlobAddOutput, err error) {
@@ -788,14 +805,19 @@ func (cloud *MultiCloud) MultipartBlobAdd(param *MultipartBlobAddInput) (out *Mu
 
 	info, err := cloud.getMultiPartInfo(*param.Commit.UploadId)
 	if err != nil {
-		return nil, err
+		mlog.Errorf("Failed to get multipart info for %s, error %v, reqId %s", *param.Commit.Key, err, reqId)
+		return
 	}
 	backend, e := cloud.getBackendChecked(info.Node)
 	if e != nil {
+		mlog.Errorf("Failed to get backend for %s, reqId %s", info.Node, reqId)
 		err = asAwsRequestError(e, reqId)
 		return
 	}
 	out, err = backend.MultipartBlobAdd(param)
+	if err != nil {
+		mlog.Errorf("Failed to add blob part for %s, error %s, reqId %s", *param.Commit.Key, err, reqId)
+	}
 
 	return
 }
@@ -835,15 +857,18 @@ func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (o
 	if err != nil {
 		return nil, err
 	}
-	backend, ok := cloud.backends[info.Node]
-	if !ok {
+
+	backend, err := cloud.getBackendChecked(info.Node)
+	if err != nil {
+		mlog.Errorf("Failed to get backend for %s, reqId %s", info.Node, reqId)
 		err = asAwsRequestError(syscall.EAGAIN, reqId)
 		return
 	}
 
 	out, err = backend.MultipartBlobCommit(param)
 	if err != nil {
-		return nil, err
+		mlog.Errorf("Failed to commit blob upload for %s, reqId %s", *param.Key, reqId)
+		return
 	}
 
 	blobInfo := &BlobInfo{}
@@ -853,6 +878,7 @@ func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (o
 		blobInfo.Etag = output.ETag
 		blobInfo.LastModified = output.LastModified
 		blobInfo.StorageClass = output.StorageClass
+		blobInfo.Node = info.Node
 	} else {
 		blobInfo.Etag = out.ETag
 		blobInfo.Node = info.Node
