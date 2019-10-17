@@ -434,7 +434,8 @@ func (cloud *MultiCloud) getMultiPartInfo(uploadId string) (*MultiPartUploadInfo
 }
 
 func requestId() string {
-	return fmt.Sprintf("%x", uuid.Must(uuid.NewV4()))[:8]
+	id := uuid.Must(uuid.NewV4())
+	return fmt.Sprintf("%v", id)[:8]
 }
 
 func (cloud *MultiCloud) Init(key string) error {
@@ -758,7 +759,7 @@ func (cloud *MultiCloud) MultipartBlobBegin(param *MultipartBlobBeginInput) (out
 
 	mlog.Debugf("Enter MultiPartBlobBegin, param %+v, reqId %s", param, reqId)
 	defer func() {
-		mlog.Debugf("Leave MultiPartBlobBegin, out %+v, err %v, reqId %s", out, err, reqId)
+		mlog.Debugf("Leave MultiPartBlobBegin, out uploadId %s, err %v, reqId %s", out.UploadId, err, reqId)
 	}()
 
 	name, backend, err := cloud.selectBackend(param.Key)
@@ -802,7 +803,7 @@ func (cloud *MultiCloud) MultipartBlobAdd(param *MultipartBlobAddInput) (out *Mu
 func (cloud *MultiCloud) MultipartBlobAbort(param *MultipartBlobCommitInput) (out *MultipartBlobAbortOutput, err error) {
 	reqId := requestId()
 
-	mlog.Debugf("Enter MultiPartBlobAbort, param %+v, reqId %s", param, reqId)
+	mlog.Debugf("Enter MultiPartBlobAbort, UploadId %s, Key %s, reqId %s", *param.UploadId, *param.Key, reqId)
 	defer func() {
 		mlog.Debugf("Leave MultiPartBlobAbort, out %+v, err %v, reqId %s", out, err, reqId)
 	}()
@@ -825,7 +826,7 @@ func (cloud *MultiCloud) MultipartBlobAbort(param *MultipartBlobCommitInput) (ou
 func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (out *MultipartBlobCommitOutput, err error) {
 	reqId := requestId()
 
-	mlog.Debugf("Enter MultiPartBlobCommit, param %+v, reqId %s", param, reqId)
+	mlog.Debugf("Enter MultiPartBlobCommit, uploadId %s, key %s, reqId %s", *param.UploadId, *param.Key, reqId)
 	defer func() {
 		mlog.Debugf("Leave MultiPartBlobCommit, out %+v, err %v, reqId %s", out, err, reqId)
 	}()
