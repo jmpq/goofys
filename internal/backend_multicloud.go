@@ -265,7 +265,7 @@ func (cloud *MultiCloud) deleteBlobInfo(key string) error {
 	return err
 }
 
-func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
+func (cloud *MultiCloud) listBlobs(param *ListBlobsInput, reqId string) (*ListBlobsOutput, error) {
 	items := []string{}
 	prefixes := make(map[string]int)
 	blobInfos := make(map[string]*BlobInfo)
@@ -293,16 +293,16 @@ func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, err
 			s = *start
 		}
 
-		kvs, err := cloud.kv.Scan(&prefix, start, 100)
+		kvs, err := cloud.kv.Scan(&prefix, start, 20)
 		if err != nil || len(kvs) == 0 {
 			if err != nil {
-				mlog.Debugf("ListBlobs error %+v", err)
+				mlog.Debugf("ListBlobs error %+v, reqId %s", err, reqId)
 				err = nil
 			}
-			mlog.Printf("prefix %s, start %v, got 0 items", prefix, s)
+			mlog.Debugf("prefix %s, start %v, got 0 items, reqId %s", prefix, s, reqId)
 			goto out
 		}
-		mlog.Printf("prefix %s, start %v, got %d items", prefix, s, len(kvs))
+		mlog.Debugf("prefix %s, start %v, got %d items, reqId %s", prefix, s, len(kvs), reqId)
 
 		for _, kv := range kvs {
 			var subKey string
@@ -317,7 +317,7 @@ func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, err
 			blobKey := strings.TrimPrefix(key, cloud.kvBlobKey(""))
 			delimiterIndex := -1
 
-			//mlog.Debugf("blogKey => %s, value => %s", blobKey, kv.Value)
+			//mlog.Debugf("blogKey => %s, value => %s, reqId %s", blobKey, kv.Value, reqId)
 
 			if param.Prefix != nil {
 				subKey = strings.TrimPrefix(blobKey, *param.Prefix)
@@ -365,10 +365,6 @@ func (cloud *MultiCloud) listBlobs(param *ListBlobsInput) (*ListBlobsOutput, err
 	}
 
 out:
-	sort.Strings(items)
-
-	mlog.Debugf("items %+v", items)
-
 	for _, item := range items {
 		info := blobInfos[item]
 		if info.Size == nil {
@@ -510,7 +506,7 @@ func (cloud *MultiCloud) ListBlobs(param *ListBlobsInput) (out *ListBlobsOutput,
 		mlog.Debugf("    maxKeys %v", *param.MaxKeys)
 	}
 
-	out, err = cloud.listBlobs(param)
+	out, err = cloud.listBlobs(param, reqId)
 	if err != nil {
 		err = asAwsRequestError(err, reqId)
 	}

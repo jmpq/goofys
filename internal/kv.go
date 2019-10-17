@@ -99,10 +99,8 @@ func (db *EtcdDB) Scan(prefix *string, start *string, limit int) ([]KVPair, erro
 
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
-		if prefix != nil {
-			if !strings.HasPrefix(key, *prefix) {
-				continue
-			}
+		if prefix != nil && !strings.HasPrefix(key, *prefix) {
+			continue
 		}
 		pair = append(pair, KVPair{Key: key, Value: kv.Value})
 	}
