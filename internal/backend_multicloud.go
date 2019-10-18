@@ -202,7 +202,7 @@ func (cloud *MultiCloud) getBackendChecked(node string) (StorageBackend, error) 
 	cloud.mutex.RLock()
 	defer cloud.mutex.RUnlock()
 
-	mlog.Debugf("node %s backendStatus %+v\n", node, cloud.backendStatus)
+	mlog.Debugf("node %s backendStatus %+v", node, cloud.backendStatus)
 	healthy, ok := cloud.backendStatus[node]
 	if !ok {
 		return nil, syscall.ENOENT
@@ -428,7 +428,9 @@ func (cloud *MultiCloud) deleteMultiPartInfo(uploadId string) error {
 func (cloud *MultiCloud) getMultiPartInfo(uploadId string) (*MultiPartUploadInfo, error) {
 	key := "multipart/" + uploadId
 	var info MultiPartUploadInfo
+
 	err := cloud.kvGet(key, &info)
+
 	return &info, err
 
 }
@@ -769,6 +771,9 @@ func (cloud *MultiCloud) MultipartBlobBegin(param *MultipartBlobBeginInput) (out
 
 	out, err = backend.MultipartBlobBegin(param)
 	info := MultiPartUploadInfo{Node: name}
+
+	mlog.Debugf("save uploadId %s, node %s", *out.UploadId, name)
+
 	err = cloud.putMultiPartInfo(*out.UploadId, &info)
 	if err != nil {
 		backend.MultipartBlobAbort(out)
@@ -833,16 +838,21 @@ func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (o
 
 	info, err := cloud.getMultiPartInfo(*param.UploadId)
 	if err != nil {
+		mlog.Debugf("Could not find uploadId %s", *param.UploadId)
 		return nil, err
 	}
-	backend, ok := cloud.backends[info.Node]
-	if !ok {
+
+	backend, err := cloud.getBackendChecked(info.Node)
+	if err != nil {
+		mlog.Debugf("Could not find backend for %s", info.Node)
 		err = asAwsRequestError(syscall.EAGAIN, reqId)
 		return
 	}
 
+	mlog.Debugf("Found node %s", info.Node)
 	out, err = backend.MultipartBlobCommit(param)
 	if err != nil {
+		mlog.Errorf("Failed to commitBlob error %+v", err)
 		return nil, err
 	}
 

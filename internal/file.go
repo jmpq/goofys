@@ -233,7 +233,7 @@ func (fh *FileHandle) WriteFile(offset int64, data []byte) (err error) {
 	// fill the hole with zero
 	if offset > fh.nextWriteOffset {
 		toSkip := offset - fh.nextWriteOffset
-		n := int64(10240)
+		n := 10240
 		data := make([]byte, n)
 
 		for {
@@ -241,8 +241,8 @@ func (fh *FileHandle) WriteFile(offset int64, data []byte) (err error) {
 				fh.buf = MBuf{}.Init(fh.poolHandle, fh.partSize(), true)
 			}
 
-			if n > toSkip {
-				n = toSkip
+			if toSkip < int64(n) {
+				n = int(toSkip)
 			}
 			nCopied, _ := fh.buf.Write(data[:n])
 			toSkip -= int64(nCopied)
