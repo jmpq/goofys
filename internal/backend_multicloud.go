@@ -70,6 +70,14 @@ func asAwsRequestError(err error, reqId string) awserr.RequestFailure {
 		awserr.New("", "", err), httpStatusCode(err), reqId)
 }
 
+func derefString(pointer *string) string {
+	if pointer != nil {
+		return *pointer
+	} else {
+		return "<nil>"
+	}
+}
+
 func NewMultiCloud(bucket string, flags *FlagStorage, config *MultiCloudConfig) (*MultiCloud, error) {
 	kvdb, err := NewEtcdDB(flags.EtcdEndpoints, false)
 	if err != nil {
@@ -470,16 +478,18 @@ func (cloud *MultiCloud) HeadBlob(param *HeadBlobInput) (out *HeadBlobOutput, er
 
 	info, err := cloud.getBlobInfo(param.Key)
 	if err != nil {
-		mlog.Debugf("Failed to get blobInfo error %+v, reqId %s", err, reqId)
+		mlog.Debugf("Failed to get blobInfo for %s error %+v, reqId %s", param.Key, err, reqId)
 		err = asAwsRequestError(err, reqId)
 		return
 	}
 	backend, err := cloud.getBackendChecked(info.Node)
 	if err != nil {
+		mlog.Debugf("Failed to get backend for %s, reqId %s", info.Node, reqId)
 		err = asAwsRequestError(err, reqId)
 		return
 	}
 
+	mlog.Debugf("Got backend %s for %s, reqId %s", info.Node, param.Key, reqId)
 	out, err = backend.HeadBlob(param)
 
 	return
@@ -544,6 +554,9 @@ func (cloud *MultiCloud) DeleteBlob(param *DeleteBlobInput) (out *DeleteBlobOutp
 	}
 
 	out, err = backend.DeleteBlob(param)
+	if err != nil {
+		cloud.kvDelete(param.Key)
+	}
 
 	return
 }
@@ -587,6 +600,10 @@ func (cloud *MultiCloud) DeleteBlobs(param *DeleteBlobsInput) (out *DeleteBlobsO
 		if e != nil {
 			err = asAwsRequestError(e, reqId)
 			return
+		}
+
+		for _, item := range items {
+			cloud.kvDelete(item)
 		}
 	}
 
@@ -761,26 +778,33 @@ func (cloud *MultiCloud) MultipartBlobBegin(param *MultipartBlobBeginInput) (out
 
 	mlog.Debugf("Enter MultiPartBlobBegin, param %+v, reqId %s", param, reqId)
 	defer func() {
-		mlog.Debugf("Leave MultiPartBlobBegin, out uploadId %s, err %v, reqId %s", out.UploadId, err, reqId)
+		mlog.Debugf("Leave MultiPartBlobBegin, err %v, reqId %s", err, reqId)
 	}()
 
 	name, backend, err := cloud.selectBackend(param.Key)
 	if err != nil {
-		return nil, err
+		mlog.Errorf("Failed to find backend for %s, reqId %s", param.Key, reqId)
+		return
 	}
 
 	out, err = backend.MultipartBlobBegin(param)
+	if err != nil {
+		mlog.Errorf("Failed to begin multipart upload for %s, reqId %s", param.Key, reqId)
+		return
+	}
+
 	info := MultiPartUploadInfo{Node: name}
 
-	mlog.Debugf("save uploadId %s, node %s", *out.UploadId, name)
+	mlog.Debugf("save uploadId %s, node %s", derefString(out.UploadId), name)
 
 	err = cloud.putMultiPartInfo(*out.UploadId, &info)
 	if err != nil {
+		mlog.Errorf("Failed to put multipart upload information for %s, reqId %s", param.Key, reqId)
 		backend.MultipartBlobAbort(out)
-		return nil, err
+		return
 	}
 
-	return out, err
+	return
 }
 
 func (cloud *MultiCloud) MultipartBlobAdd(param *MultipartBlobAddInput) (out *MultipartBlobAddOutput, err error) {
@@ -793,14 +817,20 @@ func (cloud *MultiCloud) MultipartBlobAdd(param *MultipartBlobAddInput) (out *Mu
 
 	info, err := cloud.getMultiPartInfo(*param.Commit.UploadId)
 	if err != nil {
-		return nil, err
+		mlog.Errorf("Failed to get multipart info for %s, error %v, reqId %s",
+			derefString(param.Commit.Key), err, reqId)
+		return
 	}
 	backend, e := cloud.getBackendChecked(info.Node)
 	if e != nil {
+		mlog.Errorf("Failed to get backend for %s, reqId %s", info.Node, reqId)
 		err = asAwsRequestError(e, reqId)
 		return
 	}
 	out, err = backend.MultipartBlobAdd(param)
+	if err != nil {
+		mlog.Errorf("Failed to add blob part for %s, error %s, reqId %s", *param.Commit.Key, err, reqId)
+	}
 
 	return
 }
@@ -808,7 +838,8 @@ func (cloud *MultiCloud) MultipartBlobAdd(param *MultipartBlobAddInput) (out *Mu
 func (cloud *MultiCloud) MultipartBlobAbort(param *MultipartBlobCommitInput) (out *MultipartBlobAbortOutput, err error) {
 	reqId := requestId()
 
-	mlog.Debugf("Enter MultiPartBlobAbort, UploadId %s, Key %s, reqId %s", *param.UploadId, *param.Key, reqId)
+	mlog.Debugf("Enter MultiPartBlobAbort, UploadId %s, Key %s, reqId %s",
+		derefString(param.UploadId), derefString(param.Key), reqId)
 	defer func() {
 		mlog.Debugf("Leave MultiPartBlobAbort, out %+v, err %v, reqId %s", out, err, reqId)
 	}()
@@ -831,20 +862,22 @@ func (cloud *MultiCloud) MultipartBlobAbort(param *MultipartBlobCommitInput) (ou
 func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (out *MultipartBlobCommitOutput, err error) {
 	reqId := requestId()
 
-	mlog.Debugf("Enter MultiPartBlobCommit, uploadId %s, key %s, reqId %s", *param.UploadId, *param.Key, reqId)
+	mlog.Debugf("Enter MultiPartBlobCommit, uploadId %s, key %s, reqId %s",
+		derefString(param.UploadId), derefString(param.Key), reqId)
 	defer func() {
 		mlog.Debugf("Leave MultiPartBlobCommit, out %+v, err %v, reqId %s", out, err, reqId)
 	}()
 
-	info, err := cloud.getMultiPartInfo(*param.UploadId)
+	info, err := cloud.getMultiPartInfo(derefString(param.UploadId))
 	if err != nil {
-		mlog.Debugf("Could not find uploadId %s", *param.UploadId)
-		return nil, err
+		mlog.Errorf("Failed to get multiPart upload info for %s, reqId %s",
+			derefString(param.UploadId), reqId)
+		return
 	}
 
 	backend, err := cloud.getBackendChecked(info.Node)
 	if err != nil {
-		mlog.Debugf("Could not find backend for %s", info.Node)
+		mlog.Errorf("Failed to get backend for %s, reqId %s", info.Node, reqId)
 		err = asAwsRequestError(syscall.EAGAIN, reqId)
 		return
 	}
@@ -852,8 +885,8 @@ func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (o
 	mlog.Debugf("Found node %s", info.Node)
 	out, err = backend.MultipartBlobCommit(param)
 	if err != nil {
-		mlog.Errorf("Failed to commitBlob error %+v", err)
-		return nil, err
+		mlog.Errorf("Failed to commit blob upload for %s, reqId %s", derefString(param.Key), reqId)
+		return
 	}
 
 	blobInfo := &BlobInfo{}
@@ -863,6 +896,7 @@ func (cloud *MultiCloud) MultipartBlobCommit(param *MultipartBlobCommitInput) (o
 		blobInfo.Etag = output.ETag
 		blobInfo.LastModified = output.LastModified
 		blobInfo.StorageClass = output.StorageClass
+		blobInfo.Node = info.Node
 	} else {
 		blobInfo.Etag = out.ETag
 		blobInfo.Node = info.Node
